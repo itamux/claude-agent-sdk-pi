@@ -2,6 +2,7 @@ import type { SettingSource } from "@anthropic-ai/claude-agent-sdk";
 import { existsSync, readFileSync } from "fs";
 import { homedir } from "os";
 import { dirname, join, normalize, relative, resolve } from "path";
+
 import type { ProviderSettings } from "./types.js";
 
 // --- Path constants ---

@@ -1,6 +1,7 @@
-import type { Base64ImageSource, ContentBlockParam, MessageParam } from "@anthropic-ai/sdk/resources";
 import type { SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
+import type { Base64ImageSource, ContentBlockParam, MessageParam } from "@anthropic-ai/sdk/resources";
 import type { Context, ImageContent, TextContent, ThinkingContent, ToolCall, ToolResultMessage } from "@mariozechner/pi-ai";
+
 import { mapToolNamePiToSdk } from "./handlers.js";
 
 export function buildPromptBlocks(

@@ -1,5 +1,6 @@
-import type { ToolHandler, TranslationContext } from "./types.js";
 import { pascalCase } from "change-case";
+
+import type { ToolHandler, TranslationContext } from "./types.js";
 
 // --- Helpers ---
 
@@ -7,12 +8,6 @@ import { pascalCase } from "change-case";
 function toPositiveInt(value: unknown): number | undefined {
 	if (typeof value !== "number" || !Number.isFinite(value) || value < 0) return undefined;
 	return Math.floor(value);
-}
-
-/** Coerce a value to a finite number, or return undefined */
-function toFiniteNumber(value: unknown): number | undefined {
-	if (typeof value !== "number" || !Number.isFinite(value)) return undefined;
-	return value;
 }
 
 // --- Handler definitions ---

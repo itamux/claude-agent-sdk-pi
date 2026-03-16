@@ -1,6 +1,20 @@
 import { createSdkMcpServer } from "@anthropic-ai/claude-agent-sdk";
 import type { Context, Tool } from "@mariozechner/pi-ai";
+
 import { BUILTIN_PI_NAMES, DEFAULT_TOOLS, MCP_SERVER_NAME, MCP_TOOL_PREFIX, TOOL_EXECUTION_DENIED_MESSAGE, mapToolNamePiToSdk } from "./handlers.js";
+
+const DANGEROUS_SCHEMA_KEYS = new Set(["$ref", "$id", "$schema", "$anchor", "$dynamicRef", "$dynamicAnchor"]);
+
+/** Recursively strip keys that could cause SSRF if the SDK resolves JSON Schema references */
+function stripDangerousKeys(obj: Record<string, unknown>): void {
+	for (const key of Object.keys(obj)) {
+		if (DANGEROUS_SCHEMA_KEYS.has(key)) {
+			delete obj[key];
+		} else if (obj[key] && typeof obj[key] === "object" && !Array.isArray(obj[key])) {
+			stripDangerousKeys(obj[key] as Record<string, unknown>);
+		}
+	}
+}
 
 /**
  * Convert a TypeBox schema to a plain JSON Schema object.
@@ -23,8 +37,12 @@ function toJsonSchema(typeboxSchema: unknown): Record<string, unknown> {
 	};
 
 	if (schema.properties && typeof schema.properties === "object") {
-		// Deep-clone properties to strip any TypeBox-specific symbols
-		jsonSchema.properties = JSON.parse(JSON.stringify(schema.properties));
+		// Deep-clone properties to strip TypeBox-specific symbols,
+		// then remove potentially dangerous keys ($ref could cause SSRF
+		// if the SDK resolves external references).
+		const cloned = JSON.parse(JSON.stringify(schema.properties)) as Record<string, unknown>;
+		stripDangerousKeys(cloned);
+		jsonSchema.properties = cloned;
 	}
 
 	if (Array.isArray(schema.required) && schema.required.length > 0) {

@@ -1,9 +1,10 @@
-import { query, type SDKMessage, type SettingSource } from "@anthropic-ai/claude-agent-sdk";
-import { calculateCost, createAssistantMessageEventStream, type AssistantMessage, type AssistantMessageEventStream, type Context, type Model, type SimpleStreamOptions } from "@mariozechner/pi-ai";
-import { mapToolNameSdkToPi, translateToolArgs, DEFAULT_TOOLS, TOOL_EXECUTION_DENIED_MESSAGE } from "./handlers.js";
+import { query, type SDKPartialAssistantMessage, type SettingSource } from "@anthropic-ai/claude-agent-sdk";
+import { calculateCost, createAssistantMessageEventStream, type AssistantMessage, type AssistantMessageEventStream, type Context, type Model, type SimpleStreamOptions, type Tool } from "@mariozechner/pi-ai";
+
+import { DEFAULT_TOOLS, mapToolNameSdkToPi, TOOL_EXECUTION_DENIED_MESSAGE, translateToolArgs } from "./handlers.js";
+import { buildCustomToolServers, resolveSdkTools } from "./mcp.js";
 import { buildPromptBlocks, buildPromptStream } from "./prompt.js";
 import { buildTranslationContext, extractAgentsAppend, extractSkillsAppend, loadProviderSettings } from "./settings.js";
-import { buildCustomToolServers, resolveSdkTools } from "./mcp.js";
 
 // --- Thinking budget constants ---
 
@@ -73,6 +74,39 @@ function parsePartialJson(input: string, fallback: Record<string, unknown>): Rec
 	}
 }
 
+// --- Caching for per-turn rebuilt objects ---
+
+let cachedToolsRef: Tool[] | undefined;
+let cachedToolResolution: ReturnType<typeof resolveSdkTools> | undefined;
+let cachedCustomToolsRef: Tool[] | undefined;
+let cachedMcpServers: ReturnType<typeof buildCustomToolServers>;
+
+function resolveToolsCached(context: Context) {
+	if (context.tools === cachedToolsRef && cachedToolResolution) {
+		return cachedToolResolution;
+	}
+	cachedToolsRef = context.tools;
+	cachedToolResolution = resolveSdkTools(context);
+	return cachedToolResolution;
+}
+
+function buildMcpServersCached(customTools: Tool[]) {
+	if (customTools === cachedCustomToolsRef) {
+		return cachedMcpServers;
+	}
+	cachedCustomToolsRef = customTools;
+	cachedMcpServers = buildCustomToolServers(customTools);
+	return cachedMcpServers;
+}
+
+// --- Streaming block tracking ---
+
+// Separate tracking state from output content blocks to avoid `delete (block as any)` casts.
+// The output blocks go to pi-ai; the tracking map holds transient streaming state.
+interface BlockTracker {
+	partialJson: string;  // accumulated JSON for toolCall blocks
+}
+
 // --- Main streaming function ---
 
 // Model<string> because the pi framework calls with Model<"claude-agent-sdk">
@@ -119,21 +153,17 @@ export function streamClaudeAgentSdk(model: Model<string>, context: Context, opt
 			else options.signal.addEventListener("abort", onAbort, { once: true });
 		}
 
-		const blocks = output.content as Array<
-			| { type: "text"; text: string; index: number }
-			| { type: "thinking"; thinking: string; thinkingSignature?: string; index: number }
-			| {
-				type: "toolCall";
-				id: string;
-				name: string;
-				arguments: Record<string, unknown>;
-				partialJson: string;
-				index: number;
-			}
-		>;
+		type TextBlock = { type: "text"; text: string };
+		type ThinkingBlock = { type: "thinking"; thinking: string; thinkingSignature?: string };
+		type ToolCallBlock = { type: "toolCall"; id: string; name: string; arguments: Record<string, unknown> };
+		type ContentBlock = TextBlock | ThinkingBlock | ToolCallBlock;
+
+		const blocks = output.content as ContentBlock[];
 
 		// Map from event.index -> blocks array index for O(1) lookup
 		const blockIndexMap = new Map<number, number>();
+		// Separate tracking state (partialJson) so we don't need to delete it from output blocks
+		const blockTrackers = new Map<number, BlockTracker>();
 
 		let started = false;
 		let sawStreamEvent = false;
@@ -141,26 +171,28 @@ export function streamClaudeAgentSdk(model: Model<string>, context: Context, opt
 		let shouldStopEarly = false;
 
 		try {
-			const { sdkTools, customTools, customToolNameToSdk, customToolNameToPi } = resolveSdkTools(context);
+			const { sdkTools, customTools, customToolNameToSdk, customToolNameToPi } = resolveToolsCached(context);
 			const promptBlocks = buildPromptBlocks(context, customToolNameToSdk);
 			const prompt = buildPromptStream(promptBlocks);
 
-			const cwd = (options as { cwd?: string } | undefined)?.cwd ?? process.cwd();
+			// pi may pass cwd via options; fall back to process.cwd()
+			const cwd = (options as SimpleStreamOptions & { cwd?: string } | undefined)?.cwd ?? process.cwd();
 
-			const mcpServers = buildCustomToolServers(customTools);
+			const mcpServers = buildMcpServersCached(customTools);
 			const providerSettings = loadProviderSettings();
 			const appendSystemPrompt = providerSettings.appendSystemPrompt !== false;
 			const agentsAppend = appendSystemPrompt ? extractAgentsAppend() : undefined;
 			const skillsAppend = appendSystemPrompt ? extractSkillsAppend(context.systemPrompt) : undefined;
-			// Clarify which tools are actually available, since the claude_code preset
-		// system prompt references tools (WebSearch, WebFetch, Agent, etc.) that
-		// are not enabled in this bridge.
-		const availableToolNames = sdkTools.length > 0 ? sdkTools : [...DEFAULT_TOOLS];
-		const customToolNames = customTools.map((t) => t.name);
-		const allToolNames = [...availableToolNames, ...customToolNames];
-		const toolClarification = `\n\nIMPORTANT: In this environment, only the following tools are available: ${allToolNames.join(", ")}. Do not attempt to use tools not listed here. The parameters "replace_all" (Edit), "pages" (Read), "run_in_background" (Bash), "output_mode"/"type"/"multiline"/"-B"/"-A"/"-n"/"offset" (Grep) are not supported in this environment.`;
 
-		const appendParts = [agentsAppend, skillsAppend, toolClarification].filter((part): part is string => Boolean(part));
+			// Clarify which tools are actually available, since the claude_code preset
+			// system prompt references tools (WebSearch, WebFetch, Agent, etc.) that
+			// are not enabled in this bridge.
+			const availableToolNames = sdkTools.length > 0 ? sdkTools : [...DEFAULT_TOOLS];
+			const customToolNames = customTools.map((t) => t.name);
+			const allToolNames = [...availableToolNames, ...customToolNames];
+			const toolClarification = `\n\nIMPORTANT: In this environment, only the following tools are available: ${allToolNames.join(", ")}. Do not attempt to use tools not listed here. The parameters "replace_all" (Edit), "pages" (Read), "run_in_background" (Bash), "output_mode"/"type"/"multiline"/"-B"/"-A"/"-n"/"offset" (Grep) are not supported in this environment.`;
+
+			const appendParts = [agentsAppend, skillsAppend, toolClarification].filter((part): part is string => Boolean(part));
 			const systemPromptAppend = appendParts.length > 0 ? appendParts.join("\n\n") : undefined;
 			const allowSkillAliasRewrite = Boolean(skillsAppend);
 
@@ -212,7 +244,7 @@ export function streamClaudeAgentSdk(model: Model<string>, context: Context, opt
 				switch (message.type) {
 					case "stream_event": {
 						sawStreamEvent = true;
-						const event = (message as SDKMessage & { event: any }).event;
+						const { event } = message as SDKPartialAssistantMessage;
 
 						if (event?.type === "message_start") {
 							const usage = event.message?.usage;
@@ -228,30 +260,26 @@ export function streamClaudeAgentSdk(model: Model<string>, context: Context, opt
 
 						if (event?.type === "content_block_start") {
 							if (event.content_block?.type === "text") {
-								const block = { type: "text", text: "", index: event.index } as const;
-								output.content.push(block);
-								const arrIndex = output.content.length - 1;
+								blocks.push({ type: "text", text: "" });
+								const arrIndex = blocks.length - 1;
 								blockIndexMap.set(event.index, arrIndex);
 								stream.push({ type: "text_start", contentIndex: arrIndex, partial: output });
 							} else if (event.content_block?.type === "thinking") {
-								const block = { type: "thinking", thinking: "", thinkingSignature: "", index: event.index } as const;
-								output.content.push(block);
-								const arrIndex = output.content.length - 1;
+								blocks.push({ type: "thinking", thinking: "", thinkingSignature: "" });
+								const arrIndex = blocks.length - 1;
 								blockIndexMap.set(event.index, arrIndex);
 								stream.push({ type: "thinking_start", contentIndex: arrIndex, partial: output });
 							} else if (event.content_block?.type === "tool_use") {
 								sawToolCall = true;
-								const block = {
+								blocks.push({
 									type: "toolCall",
 									id: event.content_block.id,
 									name: mapToolNameSdkToPi(event.content_block.name, customToolNameToPi),
 									arguments: (event.content_block.input as Record<string, unknown>) ?? {},
-									partialJson: "",
-									index: event.index,
-								} as const;
-								output.content.push(block);
-								const arrIndex = output.content.length - 1;
+								});
+								const arrIndex = blocks.length - 1;
 								blockIndexMap.set(event.index, arrIndex);
+								blockTrackers.set(arrIndex, { partialJson: "" });
 								stream.push({ type: "toolcall_start", contentIndex: arrIndex, partial: output });
 							}
 							break;
@@ -280,7 +308,8 @@ export function streamClaudeAgentSdk(model: Model<string>, context: Context, opt
 									partial: output,
 								});
 							} else if (event.delta?.type === "input_json_delta" && block.type === "toolCall") {
-								block.partialJson += event.delta.partial_json;
+								const tracker = blockTrackers.get(index);
+								if (tracker) tracker.partialJson += event.delta.partial_json;
 								// Skip intermediate parse — final parse happens at content_block_stop.
 								// Avoids O(N^2) cumulative JSON parsing for large tool arguments.
 								stream.push({
@@ -300,7 +329,7 @@ export function streamClaudeAgentSdk(model: Model<string>, context: Context, opt
 							if (index === undefined) break;
 							const block = blocks[index];
 							if (!block) break;
-							delete (block as any).index;
+
 							if (block.type === "text") {
 								stream.push({
 									type: "text_end",
@@ -317,12 +346,14 @@ export function streamClaudeAgentSdk(model: Model<string>, context: Context, opt
 								});
 							} else if (block.type === "toolCall") {
 								sawToolCall = true;
+								const tracker = blockTrackers.get(index);
+								const partialJson = tracker?.partialJson ?? "";
 								block.arguments = translateToolArgs(
 									block.name,
-									parsePartialJson(block.partialJson, block.arguments),
+									parsePartialJson(partialJson, block.arguments),
 									translationCtx,
 								);
-								delete (block as any).partialJson;
+								blockTrackers.delete(index);
 								stream.push({
 									type: "toolcall_end",
 									contentIndex: index,
@@ -334,7 +365,7 @@ export function streamClaudeAgentSdk(model: Model<string>, context: Context, opt
 						}
 
 						if (event?.type === "message_delta") {
-							output.stopReason = mapStopReason(event.delta?.stop_reason);
+							output.stopReason = mapStopReason(event.delta?.stop_reason ?? undefined);
 							const usage = event.usage ?? {};
 							if (usage.input_tokens != null) output.usage.input = usage.input_tokens;
 							if (usage.output_tokens != null) output.usage.output = usage.output_tokens;
