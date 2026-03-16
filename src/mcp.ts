@@ -1,63 +1,107 @@
 import { createSdkMcpServer } from "@anthropic-ai/claude-agent-sdk";
 import type { Context, Tool } from "@mariozechner/pi-ai";
+import { z } from "zod";
 
 import { BUILTIN_PI_NAMES, DEFAULT_TOOLS, MCP_SERVER_NAME, MCP_TOOL_PREFIX, TOOL_EXECUTION_DENIED_MESSAGE, mapToolNamePiToSdk } from "./handlers.js";
 
-const DANGEROUS_SCHEMA_KEYS = new Set(["$ref", "$id", "$schema", "$anchor", "$dynamicRef", "$dynamicAnchor"]);
+/**
+ * Convert a TypeBox/JSON Schema property to a Zod type.
+ *
+ * The SDK's createSdkMcpServer expects Zod raw shapes (objects where values are ZodTypes).
+ * TypeBox schemas are valid JSON Schema but fail the SDK's internal Zod detection (U9/nz),
+ * causing all custom tool schemas to resolve to empty {type:"object",properties:{}}.
+ *
+ * This function converts JSON Schema property definitions to Zod types so the SDK
+ * correctly exposes full parameter schemas to Claude.
+ */
+function jsonSchemaPropToZod(prop: Record<string, unknown>): z.ZodTypeAny {
+	const desc = typeof prop.description === "string" ? prop.description : undefined;
+	let zodType: z.ZodTypeAny;
 
-/** Recursively strip keys that could cause SSRF if the SDK resolves JSON Schema references */
-function stripDangerousKeys(obj: Record<string, unknown>): void {
-	for (const key of Object.keys(obj)) {
-		if (DANGEROUS_SCHEMA_KEYS.has(key)) {
-			delete obj[key];
-		} else if (obj[key] && typeof obj[key] === "object" && !Array.isArray(obj[key])) {
-			stripDangerousKeys(obj[key] as Record<string, unknown>);
+	switch (prop.type) {
+		case "string":
+			zodType = z.string();
+			break;
+		case "number":
+			zodType = z.number();
+			break;
+		case "integer":
+			zodType = z.number().int();
+			break;
+		case "boolean":
+			zodType = z.boolean();
+			break;
+		case "array": {
+			const items = prop.items as Record<string, unknown> | undefined;
+			const itemType = items ? jsonSchemaPropToZod(items) : z.any();
+			zodType = z.array(itemType);
+			break;
+		}
+		case "object": {
+			const nested = prop.properties as Record<string, Record<string, unknown>> | undefined;
+			if (nested) {
+				const shape = jsonSchemaToZodShape(nested, (prop.required as string[]) ?? []);
+				zodType = (z.object as Function)(shape) as z.ZodTypeAny;
+			} else {
+				zodType = z.record(z.string(), z.any());
+			}
+			break;
+		}
+		default:
+			zodType = z.any();
+	}
+
+	if (desc) zodType = zodType.describe(desc);
+
+	if (Array.isArray(prop.enum)) {
+		const values = prop.enum as [string, ...string[]];
+		if (values.length > 0) {
+			zodType = z.enum(values);
+			if (desc) zodType = zodType.describe(desc);
 		}
 	}
+
+	return zodType;
+}
+
+function jsonSchemaToZodShape(
+	properties: Record<string, Record<string, unknown>>,
+	required: string[],
+): Record<string, z.ZodTypeAny> {
+	const requiredSet = new Set(required);
+	const shape: Record<string, z.ZodTypeAny> = {};
+
+	for (const [key, prop] of Object.entries(properties)) {
+		let zodType = jsonSchemaPropToZod(prop);
+		if (!requiredSet.has(key)) {
+			zodType = zodType.optional();
+		}
+		shape[key] = zodType;
+	}
+
+	return shape;
 }
 
 /**
- * Convert a TypeBox schema to a plain JSON Schema object.
- *
- * TypeBox schemas ARE valid JSON Schema, but the SDK's internal Zod detection
- * fails on TypeBox objects, causing schemas to resolve to empty {type:"object",properties:{}}.
- * By extracting the plain JSON Schema properties, we bypass the Zod detection path.
+ * Convert a TypeBox schema (or any JSON-Schema-compatible object) to a Zod raw shape.
+ * Returns the shape object that createSdkMcpServer expects for inputSchema.
  */
-function toJsonSchema(typeboxSchema: unknown): Record<string, unknown> {
+function toZodShape(typeboxSchema: unknown): Record<string, z.ZodTypeAny> {
 	if (!typeboxSchema || typeof typeboxSchema !== "object") {
-		return { type: "object", properties: {} };
+		return {};
 	}
 
 	const schema = typeboxSchema as Record<string, unknown>;
-
-	// TypeBox schemas have a standard JSON Schema structure.
-	// Extract the core fields that describe the schema.
-	const jsonSchema: Record<string, unknown> = {
-		type: schema.type ?? "object",
-	};
-
-	if (schema.properties && typeof schema.properties === "object") {
-		// Deep-clone properties to strip TypeBox-specific symbols,
-		// then remove potentially dangerous keys ($ref could cause SSRF
-		// if the SDK resolves external references).
-		const cloned = JSON.parse(JSON.stringify(schema.properties)) as Record<string, unknown>;
-		stripDangerousKeys(cloned);
-		jsonSchema.properties = cloned;
+	const properties = schema.properties as Record<string, Record<string, unknown>> | undefined;
+	if (!properties || typeof properties !== "object") {
+		return {};
 	}
 
-	if (Array.isArray(schema.required) && schema.required.length > 0) {
-		jsonSchema.required = [...schema.required];
-	}
+	// Deep-clone to strip TypeBox-specific Symbol keys before conversion
+	const cloned = JSON.parse(JSON.stringify(properties)) as Record<string, Record<string, unknown>>;
+	const required = Array.isArray(schema.required) ? (schema.required as string[]) : [];
 
-	if (typeof schema.description === "string") {
-		jsonSchema.description = schema.description;
-	}
-
-	if (typeof schema.additionalProperties !== "undefined") {
-		jsonSchema.additionalProperties = schema.additionalProperties;
-	}
-
-	return jsonSchema;
+	return jsonSchemaToZodShape(cloned, required);
 }
 
 export function buildCustomToolServers(customTools: Tool[]): Record<string, ReturnType<typeof createSdkMcpServer>> | undefined {
@@ -66,9 +110,9 @@ export function buildCustomToolServers(customTools: Tool[]): Record<string, Retu
 	const mcpTools = customTools.map((tool) => ({
 		name: tool.name,
 		description: tool.description,
-		// Fix: convert TypeBox schema to plain JSON Schema to avoid empty schema bug.
-		// The SDK's Zod detection fails on TypeBox objects, so we pass raw JSON Schema.
-		inputSchema: toJsonSchema(tool.parameters) as unknown,
+		// Convert TypeBox/JSON Schema to Zod raw shape so the SDK's internal
+		// zodToJsonSchema conversion correctly produces full parameter schemas.
+		inputSchema: toZodShape(tool.parameters),
 		handler: async () => ({
 			content: [{ type: "text" as const, text: TOOL_EXECUTION_DENIED_MESSAGE }],
 			isError: true,
