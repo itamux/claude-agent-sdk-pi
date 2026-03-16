@@ -177,6 +177,7 @@ export function streamClaudeAgentSdk(model: Model<string>, context: Context, opt
 				cwd,
 				tools: sdkTools,
 				permissionMode: "dontAsk",
+				persistSession: false,
 				includePartialMessages: true,
 				canUseTool: async () => ({
 					behavior: "deny",
