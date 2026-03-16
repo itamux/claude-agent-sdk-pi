@@ -1,6 +1,6 @@
 import type { Base64ImageSource, ContentBlockParam, MessageParam } from "@anthropic-ai/sdk/resources";
 import type { SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
-import type { Context, ImageContent } from "@mariozechner/pi-ai";
+import type { Context, ImageContent, TextContent, ThinkingContent, ToolCall, ToolResultMessage } from "@mariozechner/pi-ai";
 import { mapToolNamePiToSdk } from "./handlers.js";
 
 export function buildPromptBlocks(
@@ -84,8 +84,9 @@ export function buildPromptBlocks(
 		}
 
 		if (message.role === "toolResult") {
-			const toolName = mapToolNamePiToSdk(message.toolName, customToolNameToSdk);
-			const isError = (message as { isError?: boolean }).isError === true;
+			const toolMsg = message as ToolResultMessage;
+			const toolName = mapToolNamePiToSdk(toolMsg.toolName, customToolNameToSdk);
+			const isError = toolMsg.isError === true;
 			const errorPrefix = isError ? "ERROR: " : "";
 			const header = `TOOL RESULT (historical ${toolName}): ${errorPrefix}`;
 			pushPrefix(header);
@@ -120,26 +121,19 @@ export function buildPromptStream(promptBlocks: ContentBlockParam[]): AsyncItera
 }
 
 function contentToText(
-	content:
-		| string
-		| Array<{
-			type: string;
-			text?: string;
-			thinking?: string;
-			name?: string;
-			arguments?: Record<string, unknown>;
-		}>,
+	content: string | Array<TextContent | ThinkingContent | ToolCall | { type: string }>,
 	customToolNameToSdk?: Map<string, string>,
 ): string {
 	if (typeof content === "string") return content;
 	if (!Array.isArray(content)) return "";
 	return content
 		.map((block) => {
-			if (block.type === "text") return block.text ?? "";
-			if (block.type === "thinking") return block.thinking ?? "";
+			if (block.type === "text") return (block as TextContent).text ?? "";
+			if (block.type === "thinking") return (block as ThinkingContent).thinking ?? "";
 			if (block.type === "toolCall") {
-				const args = block.arguments ? JSON.stringify(block.arguments) : "{}";
-				const toolName = mapToolNamePiToSdk(block.name, customToolNameToSdk);
+				const tc = block as ToolCall;
+				const args = tc.arguments ? JSON.stringify(tc.arguments) : "{}";
+				const toolName = mapToolNamePiToSdk(tc.name, customToolNameToSdk);
 				return `Historical tool call (non-executable): ${toolName} args=${args}`;
 			}
 			return `[${block.type}]`;

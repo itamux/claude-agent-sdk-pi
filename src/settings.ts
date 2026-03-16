@@ -1,7 +1,7 @@
 import type { SettingSource } from "@anthropic-ai/claude-agent-sdk";
 import { existsSync, readFileSync } from "fs";
 import { homedir } from "os";
-import { dirname, join, relative, resolve } from "path";
+import { dirname, join, normalize, relative, resolve } from "path";
 import type { ProviderSettings } from "./types.js";
 
 // --- Path constants ---
@@ -9,17 +9,29 @@ import type { ProviderSettings } from "./types.js";
 const SKILLS_ALIAS_GLOBAL = "~/.claude/skills";
 const SKILLS_ALIAS_PROJECT = ".claude/skills";
 const GLOBAL_SKILLS_ROOT = join(homedir(), ".pi", "agent", "skills");
-const PROJECT_SKILLS_ROOT = join(process.cwd(), ".pi", "skills");
 const GLOBAL_SETTINGS_PATH = join(homedir(), ".pi", "agent", "settings.json");
-const PROJECT_SETTINGS_PATH = join(process.cwd(), ".pi", "settings.json");
 const GLOBAL_AGENTS_PATH = join(homedir(), ".pi", "agent", "AGENTS.md");
 
-// --- Settings ---
+// Use functions for cwd-dependent paths to avoid stale values if cwd changes
+function getProjectSkillsRoot(): string { return join(process.cwd(), ".pi", "skills"); }
+function getProjectSettingsPath(): string { return join(process.cwd(), ".pi", "settings.json"); }
+
+// --- Settings (cached with 5s TTL to avoid re-reading on every turn) ---
+
+let cachedSettings: ProviderSettings | undefined;
+let settingsCacheTime = 0;
+const SETTINGS_CACHE_TTL_MS = 5000;
 
 export function loadProviderSettings(): ProviderSettings {
+	const now = Date.now();
+	if (cachedSettings && now - settingsCacheTime < SETTINGS_CACHE_TTL_MS) {
+		return cachedSettings;
+	}
 	const globalSettings = readSettingsFile(GLOBAL_SETTINGS_PATH);
-	const projectSettings = readSettingsFile(PROJECT_SETTINGS_PATH);
-	return { ...globalSettings, ...projectSettings };
+	const projectSettings = readSettingsFile(getProjectSettingsPath());
+	cachedSettings = { ...globalSettings, ...projectSettings };
+	settingsCacheTime = now;
+	return cachedSettings;
 }
 
 export function readSettingsFile(filePath: string): ProviderSettings {
@@ -80,25 +92,36 @@ function rewriteSkillsLocations(skillsBlock: string): string {
 		if (location.startsWith(GLOBAL_SKILLS_ROOT)) {
 			const relPath = relative(GLOBAL_SKILLS_ROOT, location).replace(/^\.+/, "");
 			rewritten = `${SKILLS_ALIAS_GLOBAL}/${relPath}`.replace(/\/\/+/g, "/");
-		} else if (location.startsWith(PROJECT_SKILLS_ROOT)) {
-			const relPath = relative(PROJECT_SKILLS_ROOT, location).replace(/^\.+/, "");
+		} else if (location.startsWith(getProjectSkillsRoot())) {
+			const relPath = relative(getProjectSkillsRoot(), location).replace(/^\.+/, "");
 			rewritten = `${SKILLS_ALIAS_PROJECT}/${relPath}`.replace(/\/\/+/g, "/");
 		}
 		return `<location>${rewritten}</location>`;
 	});
 }
 
-// --- Agents ---
+// --- Agents (cached — AGENTS.md location and content don't change mid-session) ---
+
+let cachedAgentsAppend: string | undefined | null = null; // null = not yet cached
 
 export function extractAgentsAppend(): string | undefined {
+	if (cachedAgentsAppend !== null) return cachedAgentsAppend || undefined;
 	const agentsPath = resolveAgentsMdPath();
-	if (!agentsPath) return undefined;
+	if (!agentsPath) {
+		cachedAgentsAppend = "";
+		return undefined;
+	}
 	try {
 		const content = readFileSync(agentsPath, "utf-8").trim();
-		if (!content) return undefined;
+		if (!content) {
+			cachedAgentsAppend = "";
+			return undefined;
+		}
 		const sanitized = sanitizeAgentsContent(content);
-		return sanitized.length > 0 ? `# CLAUDE.md\n\n${sanitized}` : undefined;
+		cachedAgentsAppend = sanitized.length > 0 ? `# CLAUDE.md\n\n${sanitized}` : "";
+		return cachedAgentsAppend || undefined;
 	} catch {
+		cachedAgentsAppend = "";
 		return undefined;
 	}
 }
@@ -127,7 +150,10 @@ function sanitizeAgentsContent(content: string): string {
 	sanitized = sanitized.replace(/~\/\.pi\b/gi, "~/.claude");
 	sanitized = sanitized.replace(/(^|[\s'"`])\.pi\//g, "$1.claude/");
 	sanitized = sanitized.replace(/\b\.pi\b/gi, ".claude");
-	sanitized = sanitized.replace(/\bpi\b/gi, "environment");
+	// Only replace standalone "pi" when it refers to the pi-coding-agent tool/runtime,
+	// not in other contexts (API, mathematical pi, package names like pi-ai).
+	// Match "pi" only when preceded by whitespace/start and followed by whitespace/punctuation/end.
+	sanitized = sanitized.replace(/(^|[\s"'`(])pi([\s"'`).,:;!?]|$)/gi, "$1environment$2");
 	return sanitized;
 }
 
@@ -135,18 +161,23 @@ function sanitizeAgentsContent(content: string): string {
 
 export function rewriteSkillAliasPath(pathValue: unknown): unknown {
 	if (typeof pathValue !== "string") return pathValue;
+
+	// Reject paths with traversal segments before rewriting
+	const normalized = normalize(pathValue);
+	if (normalized.includes("..")) return pathValue;
+
 	if (pathValue.startsWith(SKILLS_ALIAS_GLOBAL)) {
 		return pathValue.replace(SKILLS_ALIAS_GLOBAL, "~/.pi/agent/skills");
 	}
 	if (pathValue.startsWith(`./${SKILLS_ALIAS_PROJECT}`)) {
-		return pathValue.replace(`./${SKILLS_ALIAS_PROJECT}`, PROJECT_SKILLS_ROOT);
+		return pathValue.replace(`./${SKILLS_ALIAS_PROJECT}`, getProjectSkillsRoot());
 	}
 	if (pathValue.startsWith(SKILLS_ALIAS_PROJECT)) {
-		return pathValue.replace(SKILLS_ALIAS_PROJECT, PROJECT_SKILLS_ROOT);
+		return pathValue.replace(SKILLS_ALIAS_PROJECT, getProjectSkillsRoot());
 	}
 	const projectAliasAbs = join(process.cwd(), SKILLS_ALIAS_PROJECT);
 	if (pathValue.startsWith(projectAliasAbs)) {
-		return pathValue.replace(projectAliasAbs, PROJECT_SKILLS_ROOT);
+		return pathValue.replace(projectAliasAbs, getProjectSkillsRoot());
 	}
 	return pathValue;
 }

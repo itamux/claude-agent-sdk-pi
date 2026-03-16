@@ -1,6 +1,20 @@
 import type { ToolHandler, TranslationContext } from "./types.js";
 import { pascalCase } from "change-case";
 
+// --- Helpers ---
+
+/** Coerce a value to a positive integer, or return undefined */
+function toPositiveInt(value: unknown): number | undefined {
+	if (typeof value !== "number" || !Number.isFinite(value) || value < 0) return undefined;
+	return Math.floor(value);
+}
+
+/** Coerce a value to a finite number, or return undefined */
+function toFiniteNumber(value: unknown): number | undefined {
+	if (typeof value !== "number" || !Number.isFinite(value)) return undefined;
+	return value;
+}
+
 // --- Handler definitions ---
 
 const readHandler: ToolHandler = {
@@ -9,8 +23,8 @@ const readHandler: ToolHandler = {
 	translateArgs(args, ctx) {
 		return {
 			path: ctx.resolvePath(args.file_path ?? args.path),
-			offset: args.offset,
-			limit: args.limit,
+			offset: toPositiveInt(args.offset),
+			limit: toPositiveInt(args.limit),
 			// pages: dropped — pi doesn't support PDF page ranges
 		};
 	},
@@ -47,7 +61,7 @@ const bashHandler: ToolHandler = {
 	translateArgs(args) {
 		return {
 			command: args.command,
-			timeout: args.timeout,
+			timeout: toPositiveInt(args.timeout),
 			// Intentionally dropped (security-safer):
 			// - description: cosmetic only
 			// - run_in_background: pi doesn't support background execution
@@ -65,8 +79,8 @@ const grepHandler: ToolHandler = {
 			path: ctx.resolvePath(args.path),
 			glob: args.glob,
 			ignoreCase: args["-i"] ?? undefined,
-			context: args["-C"] ?? args.context ?? undefined,
-			limit: args.head_limit ?? args.limit ?? undefined,
+			context: toPositiveInt(args["-C"] ?? args.context),
+			limit: toPositiveInt(args.head_limit ?? args.limit),
 			// Dropped — pi has no equivalents:
 			// output_mode, -B, -A, -n, type, offset, multiline
 		};
@@ -175,6 +189,7 @@ export function translateToolArgs(
 	return input;
 }
 
-// Re-export for use in MCP module
+// Shared constants
 export const MCP_SERVER_NAME = "custom-tools";
 export const MCP_TOOL_PREFIX = `mcp__${MCP_SERVER_NAME}__`;
+export const TOOL_EXECUTION_DENIED_MESSAGE = "Tool execution is unavailable in this environment.";

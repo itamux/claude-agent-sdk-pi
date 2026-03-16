@@ -4,9 +4,7 @@
     "module": "NodeNext",
     "moduleResolution": "NodeNext",
     "types": ["node"],
-    "strict": false,
-    "strictNullChecks": true,
-    "noImplicitAny": true,
+    "strict": true,
     "skipLibCheck": true
   }
 }

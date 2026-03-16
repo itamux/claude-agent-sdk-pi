@@ -41,10 +41,16 @@ describe("Read handler", () => {
 		expect(result).toEqual({ path: "/tmp/test.ts", offset: undefined, limit: undefined });
 	});
 
-	it("passes through offset and limit", () => {
+	it("passes through offset and limit as integers", () => {
 		const result = translateToolArgs("read", { file_path: "/f.ts", offset: 10, limit: 50 }, noRewriteCtx);
 		expect(result.offset).toBe(10);
 		expect(result.limit).toBe(50);
+	});
+
+	it("rejects non-numeric offset and limit", () => {
+		const result = translateToolArgs("read", { file_path: "/f.ts", offset: "abc", limit: -5 }, noRewriteCtx);
+		expect(result.offset).toBeUndefined();
+		expect(result.limit).toBeUndefined();
 	});
 
 	it("drops pages (pi unsupported)", () => {
@@ -130,7 +136,13 @@ describe("Edit handler", () => {
 describe("Bash handler", () => {
 	it("passes command and timeout", () => {
 		const result = translateToolArgs("bash", { command: "ls -la", timeout: 5000 }, noRewriteCtx);
-		expect(result).toEqual({ command: "ls -la", timeout: 5000 });
+		expect(result.command).toBe("ls -la");
+		expect(result.timeout).toBe(5000);
+	});
+
+	it("rejects non-numeric timeout", () => {
+		const result = translateToolArgs("bash", { command: "ls", timeout: "slow" }, noRewriteCtx);
+		expect(result.timeout).toBeUndefined();
 	});
 
 	it("drops description", () => {

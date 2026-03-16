@@ -1,6 +1,6 @@
 import { query, type SDKMessage, type SettingSource } from "@anthropic-ai/claude-agent-sdk";
 import { calculateCost, createAssistantMessageEventStream, type AssistantMessage, type AssistantMessageEventStream, type Context, type Model, type SimpleStreamOptions } from "@mariozechner/pi-ai";
-import { mapToolNameSdkToPi, translateToolArgs } from "./handlers.js";
+import { mapToolNameSdkToPi, translateToolArgs, DEFAULT_TOOLS, TOOL_EXECUTION_DENIED_MESSAGE } from "./handlers.js";
 import { buildPromptBlocks, buildPromptStream } from "./prompt.js";
 import { buildTranslationContext, extractAgentsAppend, extractSkillsAppend, loadProviderSettings } from "./settings.js";
 import { buildCustomToolServers, resolveSdkTools } from "./mcp.js";
@@ -42,8 +42,7 @@ function mapThinkingTokens(
 
 	const effectiveReasoning: NonXhighThinkingLevel = reasoning === "xhigh" ? "high" : reasoning;
 
-	const customBudgets = thinkingBudgets as (Partial<Record<NonXhighThinkingLevel, number>> | undefined);
-	const customBudget = customBudgets?.[effectiveReasoning];
+	const customBudget = thinkingBudgets?.[effectiveReasoning];
 	if (typeof customBudget === "number" && Number.isFinite(customBudget) && customBudget > 0) {
 		return customBudget;
 	}
@@ -74,11 +73,10 @@ function parsePartialJson(input: string, fallback: Record<string, unknown>): Rec
 	}
 }
 
-const TOOL_EXECUTION_DENIED_MESSAGE = "Tool execution is unavailable in this environment.";
-
 // --- Main streaming function ---
 
-export function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: SimpleStreamOptions): AssistantMessageEventStream {
+// Model<string> because the pi framework calls with Model<"claude-agent-sdk">
+export function streamClaudeAgentSdk(model: Model<string>, context: Context, options?: SimpleStreamOptions): AssistantMessageEventStream {
 	const stream = createAssistantMessageEventStream();
 
 	(async () => {
@@ -154,7 +152,15 @@ export function streamClaudeAgentSdk(model: Model<any>, context: Context, option
 			const appendSystemPrompt = providerSettings.appendSystemPrompt !== false;
 			const agentsAppend = appendSystemPrompt ? extractAgentsAppend() : undefined;
 			const skillsAppend = appendSystemPrompt ? extractSkillsAppend(context.systemPrompt) : undefined;
-			const appendParts = [agentsAppend, skillsAppend].filter((part): part is string => Boolean(part));
+			// Clarify which tools are actually available, since the claude_code preset
+		// system prompt references tools (WebSearch, WebFetch, Agent, etc.) that
+		// are not enabled in this bridge.
+		const availableToolNames = sdkTools.length > 0 ? sdkTools : [...DEFAULT_TOOLS];
+		const customToolNames = customTools.map((t) => t.name);
+		const allToolNames = [...availableToolNames, ...customToolNames];
+		const toolClarification = `\n\nIMPORTANT: In this environment, only the following tools are available: ${allToolNames.join(", ")}. Do not attempt to use tools not listed here. The parameters "replace_all" (Edit), "pages" (Read), "run_in_background" (Bash), "output_mode"/"type"/"multiline"/"-B"/"-A"/"-n"/"offset" (Grep) are not supported in this environment.`;
+
+		const appendParts = [agentsAppend, skillsAppend, toolClarification].filter((part): part is string => Boolean(part));
 			const systemPromptAppend = appendParts.length > 0 ? appendParts.join("\n\n") : undefined;
 			const allowSkillAliasRewrite = Boolean(skillsAppend);
 
@@ -274,7 +280,8 @@ export function streamClaudeAgentSdk(model: Model<any>, context: Context, option
 								});
 							} else if (event.delta?.type === "input_json_delta" && block.type === "toolCall") {
 								block.partialJson += event.delta.partial_json;
-								block.arguments = parsePartialJson(block.partialJson, block.arguments);
+								// Skip intermediate parse — final parse happens at content_block_stop.
+								// Avoids O(N^2) cumulative JSON parsing for large tool arguments.
 								stream.push({
 									type: "toolcall_delta",
 									contentIndex: index,

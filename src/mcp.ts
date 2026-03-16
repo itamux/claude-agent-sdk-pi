@@ -1,9 +1,6 @@
 import { createSdkMcpServer } from "@anthropic-ai/claude-agent-sdk";
 import type { Context, Tool } from "@mariozechner/pi-ai";
-import { BUILTIN_PI_NAMES, MCP_SERVER_NAME, MCP_TOOL_PREFIX } from "./handlers.js";
-import { DEFAULT_TOOLS } from "./handlers.js";
-
-const TOOL_EXECUTION_DENIED_MESSAGE = "Tool execution is unavailable in this environment.";
+import { BUILTIN_PI_NAMES, DEFAULT_TOOLS, MCP_SERVER_NAME, MCP_TOOL_PREFIX, TOOL_EXECUTION_DENIED_MESSAGE, mapToolNamePiToSdk } from "./handlers.js";
 
 /**
  * Convert a TypeBox schema to a plain JSON Schema object.
@@ -92,17 +89,8 @@ export function resolveSdkTools(context: Context): {
 	for (const tool of context.tools) {
 		const normalized = tool.name.toLowerCase();
 		if (BUILTIN_PI_NAMES.has(normalized)) {
-			// Use the handler's SDK name via lookup
-			const handler = [...BUILTIN_PI_NAMES].includes(normalized);
-			if (handler) {
-				// Map pi name -> SDK name for builtin tools
-				const PI_TO_SDK: Record<string, string> = {
-					read: "Read", write: "Write", edit: "Edit",
-					bash: "Bash", grep: "Grep", find: "Glob", glob: "Glob",
-				};
-				const sdkName = PI_TO_SDK[normalized];
-				if (sdkName) sdkTools.add(sdkName);
-			}
+			const sdkName = mapToolNamePiToSdk(normalized);
+			sdkTools.add(sdkName);
 			continue;
 		}
 		const sdkName = `${MCP_TOOL_PREFIX}${tool.name}`;
